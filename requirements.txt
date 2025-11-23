@@ -1,0 +1,10 @@
+fastapi==0.109.0
+uvicorn==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+chromadb==0.4.24
+ollama==0.1.6
+python-dotenv==1.0.0
+aiosqlite==0.19.0
+python-multipart==0.0.6
+numpy<2.0
