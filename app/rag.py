@@ -2,6 +2,7 @@ import json
 import logging
 from typing import List, Dict, Optional, Tuple
 import ollama
+from openai import OpenAI
 import chromadb
 from chromadb.config import Settings
 from .models import BibleVerse, VerseWithContext, RetrievedVerse, QueryAnalysis, Message
@@ -12,7 +13,8 @@ logger = logging.getLogger(__name__)
 class BibleRAG:
     def __init__(
         self,
-        ollama_base_url: str,
+        llm_provider: str,
+        embedding_provider: str,
         llm_model: str,
         embedding_model: str,
         chroma_host: str,
@@ -25,8 +27,19 @@ class BibleRAG:
         query_rewrite_temperature: float,
         query_context_messages: int,
         query_rewrite_enabled: bool,
+        # Ollama (used when llm_provider or embedding_provider is "ollama")
+        ollama_base_url: str = "http://ollama:11434",
+        # OpenRouter (used when llm_provider is "openrouter")
+        openrouter_api_key: str = "",
+        openrouter_base_url: str = "https://openrouter.ai/api/v1",
+        openrouter_site_url: str = "",
+        openrouter_app_name: str = "Verbum Ex Machina",
+        # OpenAI embeddings (used when embedding_provider is "openai")
+        openai_api_key: str = "",
+        openai_embedding_base_url: str = "https://api.openai.com/v1",
     ):
-        self.ollama_client = ollama.Client(host=ollama_base_url)
+        self.llm_provider = llm_provider
+        self.embedding_provider = embedding_provider
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self.context_window_size = context_window_size
@@ -37,6 +50,42 @@ class BibleRAG:
         self.query_context_messages = query_context_messages
         self.query_rewrite_enabled = query_rewrite_enabled
 
+        if llm_provider not in ("ollama", "openrouter"):
+            raise ValueError(f"Unknown LLM_PROVIDER: {llm_provider!r}. Must be 'ollama' or 'openrouter'.")
+        if embedding_provider not in ("ollama", "openai"):
+            raise ValueError(f"Unknown EMBEDDING_PROVIDER: {embedding_provider!r}. Must be 'ollama' or 'openai'.")
+
+        if llm_provider == "ollama" or embedding_provider == "ollama":
+            self.ollama_client = ollama.Client(host=ollama_base_url)
+        else:
+            self.ollama_client = None
+
+        if llm_provider == "openrouter":
+            if not openrouter_api_key:
+                raise ValueError("OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter")
+            extra_headers = {}
+            if openrouter_site_url:
+                extra_headers["HTTP-Referer"] = openrouter_site_url
+            if openrouter_app_name:
+                extra_headers["X-Title"] = openrouter_app_name
+            self.llm_client = OpenAI(
+                base_url=openrouter_base_url,
+                api_key=openrouter_api_key,
+                default_headers=extra_headers or None,
+            )
+        else:
+            self.llm_client = None
+
+        if embedding_provider == "openai":
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai")
+            self.embed_client = OpenAI(
+                base_url=openai_embedding_base_url,
+                api_key=openai_api_key,
+            )
+        else:
+            self.embed_client = None
+
         # Initialize ChromaDB client
         self.chroma_client = chromadb.HttpClient(
             host=chroma_host,
@@ -45,6 +94,37 @@ class BibleRAG:
         )
         self.collection_name = chroma_collection
         self.collection = None
+
+    def _chat(
+        self,
+        messages: list,
+        temperature: float,
+        max_tokens: int,
+        json_mode: bool = False,
+    ) -> str:
+        """Dispatch a chat completion to the configured LLM provider."""
+        if self.llm_provider == "ollama":
+            kwargs = {
+                "model": self.llm_model,
+                "messages": messages,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            }
+            if json_mode:
+                kwargs["format"] = "json"
+            response = self.ollama_client.chat(**kwargs)
+            return response["message"]["content"]
+
+        # openrouter
+        kwargs = {
+            "model": self.llm_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = self.llm_client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content
 
     def load_bible(self, bible_json_path: str) -> List[BibleVerse]:
         """Load Bible verses from JSON file"""
@@ -76,7 +156,6 @@ class BibleRAG:
         verses_with_context = []
         for (book, chapter), chapter_verses in grouped.items():
             for i, verse in enumerate(chapter_verses):
-                # Get surrounding verses within the window
                 start_idx = max(0, i - self.context_window_size)
                 end_idx = min(len(chapter_verses), i + self.context_window_size + 1)
 
@@ -95,13 +174,22 @@ class BibleRAG:
         return verses_with_context
 
     def embed_text(self, text: str) -> List[float]:
-        """Generate embedding for text using Ollama"""
+        """Generate embedding for text using the configured embedding provider."""
         try:
-            response = self.ollama_client.embeddings(
+            if self.embedding_provider == "ollama":
+                response = self.ollama_client.embeddings(
+                    model=self.embedding_model,
+                    prompt=text
+                )
+                return response["embedding"]
+
+            # openai
+            response = self.embed_client.embeddings.create(
                 model=self.embedding_model,
-                prompt=text
+                input=text,
             )
-            return response['embedding']
+            return response.data[0].embedding
+
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
             raise
@@ -110,20 +198,17 @@ class BibleRAG:
         """Initialize ChromaDB collection with Bible verses"""
         logger.info(f"Initializing ChromaDB collection: {self.collection_name}")
 
-        # Delete existing collection if it exists
         try:
             self.chroma_client.delete_collection(name=self.collection_name)
             logger.info(f"Deleted existing collection: {self.collection_name}")
         except Exception:
             pass
 
-        # Create new collection
         self.collection = self.chroma_client.create_collection(
             name=self.collection_name,
             metadata={"description": "King James Bible verses with context"}
         )
 
-        # Prepare data for insertion
         logger.info("Generating embeddings for verses...")
         ids = []
         embeddings = []
@@ -131,18 +216,13 @@ class BibleRAG:
         metadatas = []
 
         for i, verse in enumerate(verses_with_context):
-            # Generate unique ID
             verse_id = f"{verse.book}_{verse.chapter}_{verse.verse}"
             ids.append(verse_id)
 
-            # Embed the context (not just the verse)
             embedding = self.embed_text(verse.context)
             embeddings.append(embedding)
 
-            # Store the context as document
             documents.append(verse.context)
-
-            # Store metadata
             metadatas.append({
                 "book": verse.book,
                 "chapter": verse.chapter,
@@ -154,7 +234,6 @@ class BibleRAG:
             if (i + 1) % 100 == 0:
                 logger.info(f"Processed {i + 1}/{len(verses_with_context)} verses")
 
-        # Add to collection in batches
         batch_size = 100
         for i in range(0, len(ids), batch_size):
             end_idx = min(i + batch_size, len(ids))
@@ -190,31 +269,26 @@ class BibleRAG:
 
         logger.info(f"Retrieving verses for query: {query}")
 
-        # Generate query embedding
         query_embedding = self.embed_text(query)
 
-        # Query ChromaDB
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=self.top_k_results
         )
 
-        # Parse results
         retrieved_verses = []
-        if results['ids'] and results['ids'][0]:
-            for i in range(len(results['ids'][0])):
-                metadata = results['metadatas'][0][i]
-                distance = results['distances'][0][i]
-
-                # Convert distance to similarity score (1 - normalized distance)
+        if results["ids"] and results["ids"][0]:
+            for i in range(len(results["ids"][0])):
+                metadata = results["metadatas"][0][i]
+                distance = results["distances"][0][i]
                 score = 1 / (1 + distance)
 
                 retrieved_verses.append(RetrievedVerse(
-                    book=metadata['book'],
-                    chapter=metadata['chapter'],
-                    verse=metadata['verse'],
-                    content=metadata['content'],
-                    context=metadata['context'],
+                    book=metadata["book"],
+                    chapter=metadata["chapter"],
+                    verse=metadata["verse"],
+                    content=metadata["content"],
+                    context=metadata["context"],
                     score=score
                 ))
 
@@ -230,14 +304,12 @@ class BibleRAG:
                 reasoning="Query rewriting disabled"
             )
 
-        # Build conversation context
         context_messages = []
         for msg in recent_messages[-self.query_context_messages:]:
             context_messages.append(f"{msg.role}: {msg.content}")
 
         context_str = "\n".join(context_messages) if context_messages else "No previous context"
 
-        # Create prompt for query analysis
         system_prompt = """You are a query analysis assistant for a Bible Q&A system.
 
 Your task is to analyze the user's query and determine:
@@ -265,26 +337,20 @@ User's current query: {query}
 Analyze this query."""
 
         try:
-            response = self.ollama_client.chat(
-                model=self.llm_model,
+            content = self._chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
-                options={
-                    "temperature": self.query_rewrite_temperature,
-                    "num_predict": 200
-                },
-                format="json"
+                temperature=self.query_rewrite_temperature,
+                max_tokens=200,
+                json_mode=True,
             )
-
-            # Parse JSON response
-            result = json.loads(response['message']['content'])
+            result = json.loads(content)
             return QueryAnalysis(**result)
 
         except Exception as e:
             logger.error(f"Error analyzing query: {e}")
-            # Fallback: assume retrieval needed
             return QueryAnalysis(
                 needs_retrieval=True,
                 rewritten_query=query,
@@ -298,21 +364,13 @@ Analyze this query."""
         recent_messages: List[Message]
     ) -> str:
         """Generate answer using LLM"""
-        # Build conversation history
-        conversation = []
-        for msg in recent_messages:
-            conversation.append({
-                "role": msg.role,
-                "content": msg.content
-            })
+        conversation = [{"role": msg.role, "content": msg.content} for msg in recent_messages]
 
-        # Build system prompt
         if retrieved_verses:
             verses_context = "\n\n".join([
                 f"{v.book.capitalize()} {v.chapter}:{v.verse} - {v.content}"
                 for v in retrieved_verses
             ])
-
             system_prompt = f"""You are a knowledgeable Bible assistant helping users understand Scripture.
 
 The following verses have been retrieved from the King James Bible as relevant to the user's question:
@@ -331,22 +389,16 @@ Guidelines:
 
 No specific verses were retrieved for this query. Answer based on the conversation context."""
 
-        # Add system prompt and user query
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(conversation)
         messages.append({"role": "user", "content": query})
 
         try:
-            response = self.ollama_client.chat(
-                model=self.llm_model,
+            answer = self._chat(
                 messages=messages,
-                options={
-                    "temperature": self.llm_temperature,
-                    "num_predict": self.llm_max_tokens
-                }
+                temperature=self.llm_temperature,
+                max_tokens=self.llm_max_tokens,
             )
-
-            answer = response['message']['content']
             logger.info(f"Generated answer: {answer[:100]}...")
             return answer
 

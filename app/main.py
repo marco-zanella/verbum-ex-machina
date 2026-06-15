@@ -27,8 +27,24 @@ logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
     """Application settings from environment variables"""
-    # Ollama
+    # Provider selection
+    LLM_PROVIDER: str = "ollama"       # "ollama" or "openrouter"
+    EMBEDDING_PROVIDER: str = "ollama" # "ollama" or "openai"
+
+    # Ollama (used when LLM_PROVIDER or EMBEDDING_PROVIDER is "ollama")
     OLLAMA_BASE_URL: str = "http://ollama:11434"
+
+    # OpenRouter (used when LLM_PROVIDER is "openrouter")
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_SITE_URL: str = ""
+    OPENROUTER_APP_NAME: str = "Verbum Ex Machina"
+
+    # OpenAI embeddings (used when EMBEDDING_PROVIDER is "openai")
+    OPENAI_API_KEY: str = ""
+    OPENAI_EMBEDDING_BASE_URL: str = "https://api.openai.com/v1"
+
+    # Models
     LLM_MODEL: str = "llama3.2"
     EMBEDDING_MODEL: str = "nomic-embed-text"
     LLM_TEMPERATURE: float = 0.7
@@ -106,9 +122,12 @@ async def startup_event():
     db = ConversationDatabase(settings.SQLITE_DB_PATH)
     await db.init_db()
 
+    logger.info(f"LLM provider: {settings.LLM_PROVIDER}, Embedding provider: {settings.EMBEDDING_PROVIDER}")
+
     # Initialize RAG system
     rag = BibleRAG(
-        ollama_base_url=settings.OLLAMA_BASE_URL,
+        llm_provider=settings.LLM_PROVIDER,
+        embedding_provider=settings.EMBEDDING_PROVIDER,
         llm_model=settings.LLM_MODEL,
         embedding_model=settings.EMBEDDING_MODEL,
         chroma_host=settings.CHROMA_HOST,
@@ -121,6 +140,13 @@ async def startup_event():
         query_rewrite_temperature=settings.QUERY_REWRITE_TEMPERATURE,
         query_context_messages=settings.QUERY_CONTEXT_MESSAGES,
         query_rewrite_enabled=settings.QUERY_REWRITE_ENABLED,
+        ollama_base_url=settings.OLLAMA_BASE_URL,
+        openrouter_api_key=settings.OPENROUTER_API_KEY,
+        openrouter_base_url=settings.OPENROUTER_BASE_URL,
+        openrouter_site_url=settings.OPENROUTER_SITE_URL,
+        openrouter_app_name=settings.OPENROUTER_APP_NAME,
+        openai_api_key=settings.OPENAI_API_KEY,
+        openai_embedding_base_url=settings.OPENAI_EMBEDDING_BASE_URL,
     )
 
     # Check if collection exists, if not initialize it
