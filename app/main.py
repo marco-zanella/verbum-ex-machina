@@ -1,11 +1,15 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from pydantic_settings import BaseSettings
 from typing import Optional
+import base64
 import logging
 import os
+import secrets
 
 from .database import ConversationDatabase
 from .rag import BibleRAG
@@ -79,6 +83,10 @@ class Settings(BaseSettings):
     # Bible Data
     BIBLE_JSON_PATH: str = "/assets/kjv.json"
 
+    # HTTP Basic Auth (both must be set to enable)
+    AUTH_USERNAME: str = ""
+    AUTH_PASSWORD: str = ""
+
     class Config:
         env_file = ".env"
 
@@ -88,6 +96,32 @@ settings = Settings()
 
 # Configure logging level
 logging.getLogger().setLevel(settings.LOG_LEVEL)
+
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, username: str, password: str):
+        super().__init__(app)
+        self.username = username
+        self.password = password
+
+    async def dispatch(self, request: Request, call_next):
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                provided_user, provided_pass = decoded.split(":", 1)
+                ok = secrets.compare_digest(provided_user, self.username) and \
+                     secrets.compare_digest(provided_pass, self.password)
+                if ok:
+                    return await call_next(request)
+            except Exception:
+                pass
+        return Response(
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Verbum Ex Machina"'},
+            content="Unauthorized",
+        )
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -105,6 +139,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Enable HTTP Basic Auth if both credentials are configured
+if settings.AUTH_USERNAME and settings.AUTH_PASSWORD:
+    app.add_middleware(BasicAuthMiddleware, username=settings.AUTH_USERNAME, password=settings.AUTH_PASSWORD)
+    logger.info("HTTP Basic Auth enabled")
 
 # Global instances
 db: Optional[ConversationDatabase] = None
